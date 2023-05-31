@@ -4,14 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dustin/go-humanize"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/teambition/rrule-go"
+	"github.com/thoas/go-funk"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/dustin/go-humanize"
-	"github.com/teambition/rrule-go"
-
-	"github.com/thoas/go-funk"
 
 	"github.com/standup-raven/standup-raven/server/config"
 	"github.com/standup-raven/standup-raven/server/logger"
@@ -387,6 +388,25 @@ func SaveUserStandup(userStandup *UserStandup) error {
 	return nil
 }
 
+// DeleteUserStandup delete a user's standup for a channel
+func DeleteUserStandup(userStandup *UserStandup) error {
+	// span across time zones.
+	standupConfig, err := GetStandupConfig(userStandup.ChannelID)
+	if err != nil {
+		return err
+	}
+	if standupConfig == nil {
+		return errors.New("standup not configured for channel: " + userStandup.ChannelID)
+	}
+	key := otime.Now(standupConfig.Timezone).GetDateString() + "_" + userStandup.ChannelID + userStandup.UserID
+
+	if appErr := config.Mattermost.KVDelete(util.GetKeyHash(key)); appErr != nil {
+		logger.Error("Error occurred in deleting user standup in KV store", errors.New(appErr.Error()), nil)
+		return appErr
+	}
+	return nil
+}
+
 // GetUserStandup fetches a user's standup for the specified channel and date.
 func GetUserStandup(userID, channelID string, date otime.OTime) (*UserStandup, error) {
 	key := date.GetDateString() + "_" + channelID + userID
@@ -423,6 +443,29 @@ func SaveStandupConfig(standupConfig *Config) (*Config, error) {
 
 	if err := updateChannelHeader(standupConfig); err != nil {
 		return nil, err
+	}
+	for _, v := range standupConfig.Members {
+		userStandup, err := GetUserStandup(v, standupConfig.ChannelID, otime.Now(standupConfig.Timezone))
+		if err != nil {
+			return nil, err
+		}
+
+		if userStandup != nil {
+			userStandupKeys := reflect.ValueOf(userStandup.Standup).MapKeys()
+			convertToSliceString := make([]string, len(userStandupKeys))
+			for i, v := range userStandupKeys {
+				convertToSliceString[i] = v.Interface().(string)
+			}
+			less := func(a, b string) bool { return a < b }
+			equalIgnoreOrder := cmp.Diff(convertToSliceString, standupConfig.Sections, cmpopts.SortSlices(less)) == ""
+			if equalIgnoreOrder == false {
+				if err := DeleteUserStandup(userStandup); err != nil {
+					logger.Error("Couldn't save user standup data", err, nil)
+					return nil, err
+				}
+			}
+
+		}
 	}
 
 	key := config.CacheKeyPrefixTeamStandupConfig + standupConfig.ChannelID
